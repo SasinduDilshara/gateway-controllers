@@ -51,15 +51,8 @@ parameters:
       type: string
       x-wso2-policy-advanced-param: false
       description: |
-        Specifies the JSONPath that selects what to process. When empty or set
-        to "$" (the default), every string value in the payload is processed:
-        the system prompt and every message of a conversation, whether its
-        content is a string or a list of parts, in any provider's request
-        format. A path such as "$.messages[*].content" limits processing to the
-        values it selects; when it selects an object or array, every string in
-        it is processed. A path that does not resolve against a request causes
-        the request to be rejected rather than forwarded unmasked. A payload
-        that is not JSON is processed as plain text.
+        Specifies the JSONPath used to extract the value to process. When
+        empty or set to "$", the entire payload is processed.
       default: "$"
     redactPII:
       type: boolean
