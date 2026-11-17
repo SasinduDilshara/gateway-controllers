@@ -565,3 +565,154 @@ Feature: PII masking regex policy
 
     When I delete the API "${CTX:apiName}"
     Then the response should be successful
+
+  # A chat client resends the whole conversation on every request. The default JSONPath must
+  # mask every turn, in string and in content-part form, not only the newest message.
+  Scenario: The default JSONPath masks every turn of a conversation and restores the response
+    Given I generate a unique value from "pii-default-conversation" and store it as "apiName"
+    And I generate a unique API version from "pii-default-conversation" and store it as "apiVersion"
+    And I generate a unique API context from "/pii-default-conversation" and store it as "apiContext"
+    When I create API from "resources/templates/rest-api.yaml" with values:
+      | apiVersion             | ${CTX:gatewaySpecVersion}        |
+      | name                   | ${CTX:apiName}                   |
+      | spec.displayName       | ${CTX:apiName}                   |
+      | spec.version           | ${CTX:apiVersion}                |
+      | spec.context           | ${CTX:apiContext}/$version       |
+      | spec.upstream.main.url | ${CTX:captureUpstream}           |
+      | spec.operations        | [{"method":"GET","path":"/get"},{"method":"POST","path":"/default-conversation","policies":[{"name":"pii-masking-regex","version":"v1","params":{"email":true}}]}] |
+    Then the resource creation response should indicate successful deployment
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 200
+
+    When I set header "Content-Type" to "application/json"
+    And I send a "POST" request to "${CTX:apiContext}/${CTX:apiVersion}/default-conversation" with body:
+      """
+      {
+        "model": "gpt-4o-mini",
+        "messages": [
+          {"role": "system", "content": "You are an IT helpdesk assistant."},
+          {"role": "user", "content": "Hi, my email is alice.chen@acmecorp.com"},
+          {"role": "assistant", "content": "Noted, alice.chen@acmecorp.com."},
+          {"role": "user", "content": [{"type": "text", "text": "Please cc bob@example.org as well"}]}
+        ]
+      }
+      """
+    Then the response status code should be 200
+    And the response body should contain "alice.chen@acmecorp.com"
+    And the response body should contain "bob@example.org"
+    And the response body should not contain "[EMAIL_"
+
+    When I send a "GET" request to the "capture" service at "/test/captured?path=/default-conversation"
+    Then the response body should contain "[EMAIL_"
+    And the response body should not contain "alice.chen@acmecorp.com"
+    And the response body should not contain "bob@example.org"
+    And the response body should contain "You are an IT helpdesk assistant."
+
+    When I delete the API "${CTX:apiName}"
+    Then the response should be successful
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 404
+
+  # A JSONPath that selects an array of content parts used to forward it unmasked without an
+  # error. Every string the path selects must be masked.
+  Scenario: A JSONPath that selects content parts masks every part
+    Given I generate a unique value from "pii-content-parts" and store it as "apiName"
+    And I generate a unique API version from "pii-content-parts" and store it as "apiVersion"
+    And I generate a unique API context from "/pii-content-parts" and store it as "apiContext"
+    When I create API from "resources/templates/rest-api.yaml" with values:
+      | apiVersion             | ${CTX:gatewaySpecVersion}        |
+      | name                   | ${CTX:apiName}                   |
+      | spec.displayName       | ${CTX:apiName}                   |
+      | spec.version           | ${CTX:apiVersion}                |
+      | spec.context           | ${CTX:apiContext}/$version       |
+      | spec.upstream.main.url | ${CTX:captureUpstream}           |
+      | spec.operations        | [{"method":"GET","path":"/get"},{"method":"POST","path":"/content-parts","policies":[{"name":"pii-masking-regex","version":"v1","params":{"email":true,"jsonPath":"$.messages[-1].content"}}]}] |
+    Then the resource creation response should indicate successful deployment
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 200
+
+    When I set header "Content-Type" to "application/json"
+    And I send a "POST" request to "${CTX:apiContext}/${CTX:apiVersion}/content-parts" with body:
+      """
+      {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "My email is alice.chen@acmecorp.com"},
+        {"type": "text", "text": "and my manager is bob@example.org"}
+      ]}]}
+      """
+    Then the response status code should be 200
+
+    When I send a "GET" request to the "capture" service at "/test/captured?path=/content-parts"
+    Then the response body should contain "[EMAIL_"
+    And the response body should not contain "alice.chen@acmecorp.com"
+    And the response body should not contain "bob@example.org"
+
+    When I delete the API "${CTX:apiName}"
+    Then the response should be successful
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 404
+
+  # "[*]" selects every message; a turn that only calls tools has no content and is skipped.
+  Scenario: A wildcard JSONPath masks the content of every message
+    Given I generate a unique value from "pii-wildcard-messages" and store it as "apiName"
+    And I generate a unique API version from "pii-wildcard-messages" and store it as "apiVersion"
+    And I generate a unique API context from "/pii-wildcard-messages" and store it as "apiContext"
+    When I create API from "resources/templates/rest-api.yaml" with values:
+      | apiVersion             | ${CTX:gatewaySpecVersion}        |
+      | name                   | ${CTX:apiName}                   |
+      | spec.displayName       | ${CTX:apiName}                   |
+      | spec.version           | ${CTX:apiVersion}                |
+      | spec.context           | ${CTX:apiContext}/$version       |
+      | spec.upstream.main.url | ${CTX:captureUpstream}           |
+      | spec.operations        | [{"method":"GET","path":"/get"},{"method":"POST","path":"/wildcard-messages","policies":[{"name":"pii-masking-regex","version":"v1","params":{"email":true,"jsonPath":"$.messages[*].content"}}]}] |
+    Then the resource creation response should indicate successful deployment
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 200
+
+    When I set header "Content-Type" to "application/json"
+    And I send a "POST" request to "${CTX:apiContext}/${CTX:apiVersion}/wildcard-messages" with body:
+      """
+      {"messages": [
+        {"role": "user", "content": "I am alice.chen@acmecorp.com"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "record for bob@example.org"}
+      ]}
+      """
+    Then the response status code should be 200
+
+    When I send a "GET" request to the "capture" service at "/test/captured?path=/wildcard-messages"
+    Then the response body should contain "[EMAIL_"
+    And the response body should not contain "alice.chen@acmecorp.com"
+    And the response body should not contain "bob@example.org"
+    And the response body should contain "lookup"
+
+    When I delete the API "${CTX:apiName}"
+    Then the response should be successful
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 404
+
+  # The JSONPath from a reported configuration: for an agent that sends its system prompt first
+  # with string content, messages[0].content is a string, so the path does not resolve. The policy
+  # must refuse the request, not forward it unmasked.
+  Scenario: A JSONPath into content parts rejects a conversation whose content is a string
+    Given I generate a unique value from "pii-parts-path-string" and store it as "apiName"
+    And I generate a unique API version from "pii-parts-path-string" and store it as "apiVersion"
+    And I generate a unique API context from "/pii-parts-path-string" and store it as "apiContext"
+    When I create API from "resources/templates/rest-api.yaml" with values:
+      | apiVersion             | ${CTX:gatewaySpecVersion}        |
+      | name                   | ${CTX:apiName}                   |
+      | spec.displayName       | ${CTX:apiName}                   |
+      | spec.version           | ${CTX:apiVersion}                |
+      | spec.context           | ${CTX:apiContext}/$version       |
+      | spec.upstream.main.url | ${CTX:captureUpstream}           |
+      | spec.operations        | [{"method":"GET","path":"/get"},{"method":"POST","path":"/parts-path-string","policies":[{"name":"pii-masking-regex","version":"v1","params":{"email":true,"jsonPath":"$.messages[0].content[0].text"}}]}] |
+    Then the resource creation response should indicate successful deployment
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 200
+
+    When I set header "Content-Type" to "application/json"
+    And I send a "POST" request to "${CTX:apiContext}/${CTX:apiVersion}/parts-path-string" with body:
+      """
+      {"messages": [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "My email is alice.chen@acmecorp.com"}
+      ]}
+      """
+    Then the response status code should be 500
+    And the response body should contain "not an array: content"
+
+    When I delete the API "${CTX:apiName}"
+    Then the response should be successful
+    And I send a "GET" request to "${CTX:apiContext}/${CTX:apiVersion}/get" until status 404

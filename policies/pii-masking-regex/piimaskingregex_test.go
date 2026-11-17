@@ -125,8 +125,13 @@ func TestPIIMaskingRegexPolicy_GetPolicy_DefaultsAndBuiltins(t *testing.T) {
 		"ssn":   true,
 	})
 
-	if got := p.params.JsonPath; got != "$.messages[-1].content" {
-		t.Fatalf("expected default jsonPath '$.messages[-1].content', got %q", got)
+	// The default is the whole payload. The former default, "$.messages[-1].content", left every
+	// earlier turn of a conversation unmasked.
+	if got := p.params.JsonPath; got != "$" {
+		t.Fatalf("expected default jsonPath '$', got %q", got)
+	}
+	if len(p.params.jsonPathSteps) != 0 {
+		t.Fatalf("expected the default jsonPath to select the whole payload, got %d steps", len(p.params.jsonPathSteps))
 	}
 	if p.params.RedactPII {
 		t.Fatalf("expected default redactPII=false")

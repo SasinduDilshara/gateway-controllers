@@ -18,14 +18,17 @@
 package piimaskingregex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	policy "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	utils "github.com/wso2/api-platform/sdk/core/utils"
@@ -39,7 +42,7 @@ const (
 	DefaultEmailEntityName    = "EMAIL"
 	DefaultPhoneEntityName    = "PHONE"
 	DefaultSSNEntityName      = "SSN"
-	DefaultJSONPath           = "$.messages[-1].content"
+	DefaultJSONPath           = "$" // every string value in the payload; see maskPayload
 	DefaultEmailRegex         = `(?i)\b[a-z0-9.!#$%&'*+/=?^_{|}~-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])\b`
 	DefaultPhoneRegex         = `(?:\+?1[-.\s]?)?(?:\([2-9][0-9]{2}\)|[2-9][0-9]{2})[-.\s]?[2-9][0-9]{2}[-.\s]?[0-9]{4}\b`
 	DefaultSSNRegex           = `(?:00[1-9]|0[1-9][0-9]|[1-5][0-9]{2}|6(?:[0-57-9][0-9]|6[0-57-9])|[7-8][0-9]{2})[- ]?(?:0[1-9]|[1-9][0-9])[- ]?(?:000[1-9]|00[1-9][0-9]|0[1-9][0-9]{2}|[1-9][0-9]{3})\b`
@@ -90,6 +93,9 @@ type PIIMaskingRegexPolicyParams struct {
 	PIIEntities map[string]*regexp.Regexp
 	JsonPath    string
 	RedactPII   bool
+
+	// jsonPathSteps is JsonPath parsed once at policy creation; empty means the whole payload.
+	jsonPathSteps []jsonPathStep
 }
 
 // GetPolicy is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
@@ -223,6 +229,11 @@ func parseParams(params map[string]interface{}) (PIIMaskingRegexPolicyParams, er
 			return result, fmt.Errorf("'jsonPath' must be a string")
 		}
 	}
+	steps, err := parseJSONPath(result.JsonPath)
+	if err != nil {
+		return result, fmt.Errorf("'jsonPath' is invalid: %w", err)
+	}
+	result.jsonPathSteps = steps
 
 	// Extract optional redactPII parameter
 	if redactPIIRaw, ok := params["redactPII"]; ok {
@@ -248,85 +259,192 @@ func parseBoolParam(params map[string]interface{}, key string) (bool, error) {
 	return val, nil
 }
 
-// maskPIIFromContent masks PII from content using regex patterns
-func (p *PIIMaskingRegexPolicy) maskPIIFromContent(content string, piiEntities map[string]*regexp.Regexp, metadata map[string]interface{}) (string, error) {
-	if content == "" {
-		return "", nil
-	}
+// placeholderPattern matches a placeholder this policy generates, so a value that already is one
+// (a client resending a masked transcript, or a custom regex broad enough to match one) is never
+// masked a second time.
+var placeholderPattern = regexp.MustCompile(`^\[[A-Z_]+_[0-9a-f]{4}\]$`)
 
-	maskedContent := content
-	maskedPIIEntities := make(map[string]string)
-	counter := 0
-	// Pre-compile placeholder pattern for efficiency
-	placeholderPattern := regexp.MustCompile(`^\[[A-Z_]+_[0-9a-f]{4}\]$`)
-
-	// First pass: find all matches without replacing to avoid nested replacements
-	allMatches := make(map[string]string) // original -> placeholder
-	entityHits := make(map[string]int)    // entity name -> occurrences, for debug logging
-	for key, pattern := range piiEntities {
-		matches := pattern.FindAllString(maskedContent, -1)
-		for _, match := range matches {
-			if placeholderPattern.MatchString(match) {
-				continue
-			}
-			entityHits[key]++
-			if _, exists := allMatches[match]; !exists {
-				// Generate unique placeholder like [EMAIL_0000]
-				placeholder := fmt.Sprintf("[%s_%04x]", key, counter)
-				allMatches[match] = placeholder
-				maskedPIIEntities[match] = placeholder
-				counter++
-			}
-		}
-	}
-
-	// Second pass: replace all matches
-	originals := make([]string, 0, len(allMatches))
-	for original := range allMatches {
-		originals = append(originals, original)
-	}
-	sort.Slice(originals, func(i, j int) bool { return len(originals[i]) > len(originals[j]) })
-	for _, original := range originals {
-		maskedContent = strings.ReplaceAll(maskedContent, original, allMatches[original])
-	}
-
-	p.logPIIDetection("mask", entityHits)
-
-	// Store PII mappings in metadata for response restoration
-	if len(maskedPIIEntities) > 0 {
-		metadata[MetadataKeyPIIEntities] = maskedPIIEntities
-	}
-
-	if len(allMatches) > 0 {
-		return maskedContent, nil
-	}
-
-	return "", nil
+// namedPattern is one configured PII detector.
+type namedPattern struct {
+	name    string
+	pattern *regexp.Regexp
 }
 
-// redactPIIFromContent redacts PII from content using regex patterns
-func (p *PIIMaskingRegexPolicy) redactPIIFromContent(content string, piiEntities map[string]*regexp.Regexp) string {
-	if content == "" {
-		return ""
+// piiMasker masks or redacts PII across every string of ONE request.
+//
+// A request carries PII in many strings — every turn of a conversation, every content part — and
+// they must share one placeholder table: the same value gets the same placeholder wherever it
+// appears, and two different values never get the same one. Masking each string on its own would
+// restart the counter per string, so "[EMAIL_0000]" would stand for a different address in each
+// message and the response could not be restored. A masker is created per request and never shared.
+type piiMasker struct {
+	detectors []namedPattern
+	redact    bool
+	// assigned maps original → placeholder for everything masked so far in this request. It is
+	// what processResponseBody restores from.
+	assigned map[string]string
+	counter  int
+	// reserved holds placeholder-shaped text the request already contained. A new placeholder must
+	// not reuse one: the response restore would turn both back into the same original.
+	reserved map[string]bool
+	// hits counts matches per entity, for the debug log. Values are never logged.
+	hits map[string]int
+}
+
+// placeholderTokenPattern finds placeholder-shaped tokens anywhere in a payload.
+var placeholderTokenPattern = regexp.MustCompile(`\[[A-Z_]+_[0-9a-f]{4}\]`)
+
+// reservePlaceholdersIn records every placeholder-shaped token already present in payload.
+func (m *piiMasker) reservePlaceholdersIn(payload []byte) {
+	for _, token := range placeholderTokenPattern.FindAll(payload, -1) {
+		m.reserved[string(token)] = true
 	}
+}
 
-	maskedContent := content
-	entityHits := make(map[string]int) // entity name -> occurrences, for debug logging
-
-	for key, pattern := range piiEntities {
-		if n := len(pattern.FindAllStringIndex(maskedContent, -1)); n > 0 {
-			entityHits[key] = n
-			maskedContent = pattern.ReplaceAllString(maskedContent, "*****")
+// nextPlaceholder returns the next unused placeholder for an entity.
+func (m *piiMasker) nextPlaceholder(entity string) string {
+	for {
+		placeholder := fmt.Sprintf("[%s_%04x]", entity, m.counter)
+		m.counter++
+		if !m.reserved[placeholder] {
+			return placeholder
 		}
 	}
+}
 
-	p.logPIIDetection("redact", entityHits)
-
-	if len(entityHits) > 0 {
-		return maskedContent
+// newPIIMasker builds a masker over the configured detectors, ordered by entity name so that
+// placeholder numbering is deterministic rather than following map iteration order.
+func newPIIMasker(entities map[string]*regexp.Regexp, redact bool) *piiMasker {
+	detectors := make([]namedPattern, 0, len(entities))
+	for name, pattern := range entities {
+		detectors = append(detectors, namedPattern{name: name, pattern: pattern})
 	}
+	sort.Slice(detectors, func(i, j int) bool { return detectors[i].name < detectors[j].name })
+	return &piiMasker{
+		detectors: detectors,
+		redact:    redact,
+		assigned:  make(map[string]string),
+		reserved:  make(map[string]bool),
+		hits:      make(map[string]int),
+	}
+}
 
-	return ""
+// apply masks or redacts the PII in one string and reports whether it changed.
+func (m *piiMasker) apply(content string) (string, bool) {
+	if content == "" {
+		return content, false
+	}
+	if m.redact {
+		return m.redactString(content)
+	}
+	return m.maskString(content)
+}
+
+// maskString replaces each PII match with its reversible placeholder. Every detector runs against
+// the original string, and replacement happens afterwards, longest original first, so one match
+// can never be rewritten inside another's placeholder.
+func (m *piiMasker) maskString(content string) (string, bool) {
+	found := make(map[string]string) // original → placeholder, for this string only
+	for _, d := range m.detectors {
+		for _, match := range d.pattern.FindAllString(content, -1) {
+			if match == "" || placeholderPattern.MatchString(match) {
+				continue
+			}
+			m.hits[d.name]++
+			placeholder, exists := m.assigned[match]
+			if !exists {
+				placeholder = m.nextPlaceholder(d.name)
+				m.assigned[match] = placeholder
+			}
+			found[match] = placeholder
+		}
+	}
+	if len(found) == 0 {
+		return content, false
+	}
+	originals := make([]string, 0, len(found))
+	for original := range found {
+		originals = append(originals, original)
+	}
+	sort.Slice(originals, func(i, j int) bool {
+		if len(originals[i]) != len(originals[j]) {
+			return len(originals[i]) > len(originals[j])
+		}
+		return originals[i] < originals[j]
+	})
+	masked := content
+	for _, original := range originals {
+		masked = strings.ReplaceAll(masked, original, found[original])
+	}
+	return masked, masked != content
+}
+
+// redactString replaces each PII match with "*****". Redaction is one-way, so nothing is recorded.
+func (m *piiMasker) redactString(content string) (string, bool) {
+	redacted := content
+	for _, d := range m.detectors {
+		if n := len(d.pattern.FindAllStringIndex(redacted, -1)); n > 0 {
+			m.hits[d.name] += n
+			redacted = d.pattern.ReplaceAllString(redacted, "*****")
+		}
+	}
+	return redacted, redacted != content
+}
+
+// rewriteSelected masks a value the JSONPath selected. A string is masked. A JSON number the path
+// points at directly is masked through its text, as a scalar was before, and becomes a string
+// only when it actually contained PII. An object or array — content parts, a whole message, the
+// whole document — has every string inside it masked, at any depth; numbers, booleans and nulls
+// inside it are data, not text, and are left exactly as they are.
+func (m *piiMasker) rewriteSelected(value interface{}) (interface{}, bool) {
+	switch v := value.(type) {
+	case string:
+		return m.apply(v)
+	case json.Number:
+		if masked, changed := m.apply(v.String()); changed {
+			return masked, true
+		}
+		return v, false
+	case map[string]interface{}, []interface{}:
+		return m.rewriteStrings(v)
+	default:
+		return value, false
+	}
+}
+
+// rewriteStrings masks every string inside a container, recursively, updating it in place. Only
+// values are masked: object keys are structure, not content.
+func (m *piiMasker) rewriteStrings(value interface{}) (interface{}, bool) {
+	switch v := value.(type) {
+	case string:
+		return m.apply(v)
+	case map[string]interface{}:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		// Sorted so placeholder numbering does not depend on map iteration order.
+		sort.Strings(keys)
+		changed := false
+		for _, k := range keys {
+			if replaced, c := m.rewriteStrings(v[k]); c {
+				v[k] = replaced
+				changed = true
+			}
+		}
+		return v, changed
+	case []interface{}:
+		changed := false
+		for i := range v {
+			if replaced, c := m.rewriteStrings(v[i]); c {
+				v[i] = replaced
+				changed = true
+			}
+		}
+		return v, changed
+	default:
+		return value, false
+	}
 }
 
 // logPIIDetection emits a debug log describing which PII entities matched.
@@ -370,37 +488,6 @@ func (p *PIIMaskingRegexPolicy) restorePIIInResponse(originalContent string, mas
 	return transformedContent
 }
 
-// updatePayloadWithMaskedContent updates the original payload by replacing the extracted content
-func (p *PIIMaskingRegexPolicy) updatePayloadWithMaskedContent(originalPayload []byte, extractedValue, modifiedContent string, jsonPath string) []byte {
-	if jsonPath == "" || jsonPath == "$" {
-		// If no JSONPath, the entire payload was processed, return the modified content
-		return []byte(modifiedContent)
-	}
-
-	// If JSONPath is specified, update only the specific field in the JSON structure
-	var jsonData map[string]interface{}
-	if err := json.Unmarshal(originalPayload, &jsonData); err != nil {
-		// Fallback to returning the modified content as-is
-		return []byte(modifiedContent)
-	}
-
-	// Set the new value at the JSONPath location
-	err := utils.SetValueAtJSONPath(jsonData, jsonPath, modifiedContent)
-	if err != nil {
-		// Fallback to returning the original payload
-		return originalPayload
-	}
-
-	// Marshal back to JSON to get the full modified payload
-	updatedPayload, err := json.Marshal(jsonData)
-	if err != nil {
-		// Fallback to returning the original payload
-		return originalPayload
-	}
-
-	return updatedPayload
-}
-
 // OnRequestHeaders implements v2alpha.RequestHeaderPolicy.
 // PII masking operates on the body, so headers are passed through unchanged.
 func (p *PIIMaskingRegexPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
@@ -427,44 +514,123 @@ func (p *PIIMaskingRegexPolicy) processRequestBody(reqCtx *policy.RequestContext
 		return policy.UpstreamRequestModifications{}
 	}
 
-	if reqCtx.Body == nil || reqCtx.Body.Content == nil {
+	if reqCtx.Body == nil || len(bytes.TrimSpace(reqCtx.Body.Content)) == 0 {
 		return policy.UpstreamRequestModifications{}
 	}
 	payload := reqCtx.Body.Content
 
-	extractedValue, ok, err := extractStringFromPath(payload, p.params.JsonPath)
+	masker := newPIIMasker(p.params.PIIEntities, p.params.RedactPII)
+	masker.reservePlaceholdersIn(payload)
+	action := "mask"
+	if p.params.RedactPII {
+		action = "redact"
+	}
+
+	modifiedPayload, changed, err := p.maskPayload(payload, masker)
 	if err != nil {
+		var maskErr *maskingError
+		if errors.As(err, &maskErr) {
+			return p.buildErrorResponse(fmt.Sprintf("error masking PII: %v", maskErr.err)).(policy.RequestAction)
+		}
 		return p.buildErrorResponse(fmt.Sprintf("error extracting value from JSONPath: %v", err)).(policy.RequestAction)
 	}
-	if !ok {
-		// Value at path is not a scalar (e.g. multimodal content array); skip masking.
+	p.logPIIDetection(action, masker.hits)
+	if !changed {
 		return policy.UpstreamRequestModifications{}
 	}
 
-	extractedValue = textCleanRegexCompiled.ReplaceAllString(extractedValue, "")
-	extractedValue = strings.TrimSpace(extractedValue)
-
-	var modifiedContent string
-	if p.params.RedactPII {
-		modifiedContent = p.redactPIIFromContent(extractedValue, p.params.PIIEntities)
-	} else {
+	// Store PII mappings in metadata for response restoration.
+	if !p.params.RedactPII && len(masker.assigned) > 0 {
 		if reqCtx.Metadata == nil {
 			reqCtx.Metadata = make(map[string]interface{})
 		}
-		modifiedContent, err = p.maskPIIFromContent(extractedValue, p.params.PIIEntities, reqCtx.Metadata)
-		if err != nil {
-			return p.buildErrorResponse(fmt.Sprintf("error masking PII: %v", err)).(policy.RequestAction)
+		reqCtx.Metadata[MetadataKeyPIIEntities] = masker.assigned
+	}
+	return policy.UpstreamRequestModifications{Body: modifiedPayload}
+}
+
+// maskPayload masks the PII in a request payload as the configured JSONPath directs, returning the
+// rewritten payload and whether anything changed.
+//
+// With no JSONPath ("" or "$", the default) every string value in the JSON document is processed:
+// the system prompt, every turn of a conversation, content sent as a string or as parts, and
+// fields outside the conversation, in any provider's request format. Only string values are
+// rewritten, so the result is always valid JSON — scanning the raw text instead would turn a
+// number that looks like a phone number into a bare placeholder and break the document. A payload
+// that is not JSON is processed as plain text, as before; one that is not even valid UTF-8 (a
+// binary upload) has no text to mask and is forwarded untouched rather than corrupted.
+//
+// With a JSONPath every value it selects is processed: a string or number directly, an object or
+// array (content parts, a whole message) through every string inside it. A path that does not
+// resolve against the payload is an error: the policy cannot tell what it was meant to mask, and
+// forwarding the request would send that content upstream unmasked.
+func (p *PIIMaskingRegexPolicy) maskPayload(payload []byte, masker *piiMasker) ([]byte, bool, error) {
+	wholePayload := len(p.params.jsonPathSteps) == 0
+
+	document, err := decodeJSONDocument(payload)
+	if err != nil {
+		if !wholePayload {
+			return nil, false, err
 		}
+		if !utf8.Valid(payload) {
+			return nil, false, nil
+		}
+		// Plain text, processed as before.
+		text := textCleanRegexCompiled.ReplaceAllString(string(payload), "")
+		text = strings.TrimSpace(text)
+		masked, changed := masker.apply(text)
+		if !changed {
+			return nil, false, nil
+		}
+		return []byte(masked), true, nil
 	}
 
-	if modifiedContent != "" && modifiedContent != extractedValue {
-		modifiedPayload := p.updatePayloadWithMaskedContent(payload, extractedValue, modifiedContent, p.params.JsonPath)
-		return policy.UpstreamRequestModifications{
-			Body: modifiedPayload,
-		}
+	document, changed, err := rewriteAtPath(document, p.params.jsonPathSteps, masker.rewriteSelected)
+	if err != nil {
+		return nil, false, err
 	}
+	if !changed {
+		return nil, false, nil
+	}
+	encoded, err := encodeJSONDocument(document)
+	if err != nil {
+		return nil, false, &maskingError{err: err}
+	}
+	return encoded, true, nil
+}
 
-	return policy.UpstreamRequestModifications{}
+// maskingError marks a failure to write the masked payload back, as distinct from a JSONPath that
+// does not resolve, so the mediation failure names the right cause.
+type maskingError struct{ err error }
+
+func (e *maskingError) Error() string { return e.err.Error() }
+
+// decodeJSONDocument parses a payload into a generic document. Numbers are kept as json.Number so
+// that re-encoding writes them back exactly — float64 would round large integers such as IDs and
+// seeds. Trailing data after the first value is rejected, as json.Unmarshal rejects it.
+func decodeJSONDocument(payload []byte) (interface{}, error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var document interface{}
+	if err := decoder.Decode(&document); err != nil {
+		return nil, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, errors.New("invalid character after top-level value")
+	}
+	return document, nil
+}
+
+// encodeJSONDocument serialises a document without HTML-escaping, so markup characters in a prompt
+// reach the upstream as written rather than as \u escape sequences.
+func encodeJSONDocument(document interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(document); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 // OnResponseBody restores PII placeholders in a buffered response body.
@@ -989,34 +1155,6 @@ func restore(content string, maskedMap map[string]string) string {
 		result = strings.ReplaceAll(result, placeholder, original)
 	}
 	return result
-}
-
-// extractStringFromPath extracts the value at jsonPath from payload as a string.
-// Returns (value, true, nil) when the value is a scalar string or number.
-// Returns ("", false, nil) when the value exists but is not a scalar (e.g. array/object).
-// Returns ("", false, err) on path or parse errors.
-func extractStringFromPath(payload []byte, jsonPath string) (string, bool, error) {
-	if jsonPath == "" || jsonPath == "$" {
-		return string(payload), true, nil
-	}
-	var jsonData map[string]interface{}
-	if err := json.Unmarshal(payload, &jsonData); err != nil {
-		return "", false, err
-	}
-	raw, err := utils.ExtractValueFromJsonpath(jsonData, jsonPath)
-	if err != nil {
-		return "", false, err
-	}
-	switch v := raw.(type) {
-	case string:
-		return v, true, nil
-	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64), true, nil
-	case int:
-		return strconv.Itoa(v), true, nil
-	default:
-		return "", false, nil
-	}
 }
 
 func (p *PIIMaskingRegexPolicy) buildErrorResponse(reason string) interface{} {
